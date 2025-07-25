@@ -1,5 +1,6 @@
 ;; RideFlow - Decentralized Ride-Sharing Platform
 ;; A smart contract for managing ride requests, driver matching, and payments
+;; Updated with GPS coordinate validation and simplified distance-based fare calculation
 
 ;; Constants
 (define-constant contract-owner tx-sender)
@@ -11,14 +12,23 @@
 (define-constant err-unauthorized (err u105))
 (define-constant err-invalid-input (err u106))
 (define-constant err-invalid-fee (err u107))
+(define-constant err-invalid-coordinates (err u108))
 
 ;; Input validation constants
 (define-constant max-string-length u50)
-(define-constant max-location-length u100)
 (define-constant max-vehicle-length u20)
 (define-constant max-plate-length u10)
-(define-constant min-fare u1000) ;; Minimum fare in micro-STX
+(define-constant base-fare u2000) ;; Base fare in micro-STX
 (define-constant max-fee u1000) ;; Maximum platform fee 100%
+
+;; GPS coordinate constants (in micro-degrees: lat/lng * 1,000,000)
+(define-constant min-latitude -90000000)
+(define-constant max-latitude 90000000)
+(define-constant min-longitude -180000000)
+(define-constant max-longitude 180000000)
+
+;; Distance and fare calculation constants
+(define-constant fare-per-unit u100) ;; 100 micro-STX per distance unit
 
 ;; Data Variables
 (define-data-var ride-counter uint u0)
@@ -45,8 +55,11 @@
 (define-map rides uint {
     rider: principal,
     driver: (optional principal),
-    pickup-location: (string-ascii 100),
-    destination: (string-ascii 100),
+    pickup-lat: int,
+    pickup-lng: int,
+    destination-lat: int,
+    destination-lng: int,
+    distance: uint,
     fare: uint,
     status: (string-ascii 20), ;; "requested", "accepted", "in-progress", "completed", "cancelled"
     created-at: uint,
@@ -67,10 +80,6 @@
     (and (> (len str) u0) (<= (len str) max-string-length))
 )
 
-(define-private (is-valid-location (location (string-ascii 100)))
-    (and (> (len location) u0) (<= (len location) max-location-length))
-)
-
 (define-private (is-valid-vehicle-type (vehicle (string-ascii 20)))
     (and (> (len vehicle) u0) (<= (len vehicle) max-vehicle-length))
 )
@@ -79,12 +88,44 @@
     (and (> (len plate) u0) (<= (len plate) max-plate-length))
 )
 
-(define-private (is-valid-fare (fare uint))
-    (>= fare min-fare)
-)
-
 (define-private (is-valid-fee (fee uint))
     (<= fee max-fee)
+)
+
+;; GPS coordinate validation
+(define-private (is-valid-latitude (lat int))
+    (and (>= lat min-latitude) (<= lat max-latitude))
+)
+
+(define-private (is-valid-longitude (lng int))
+    (and (>= lng min-longitude) (<= lng max-longitude))
+)
+
+(define-private (is-valid-coordinates (lat int) (lng int))
+    (and (is-valid-latitude lat) (is-valid-longitude lng))
+)
+
+;; Simplified distance calculation using Manhattan distance
+;; This avoids complex square root calculations and function interdependencies
+(define-private (calculate-simple-distance (lat1 int) (lng1 int) (lat2 int) (lng2 int))
+    (let (
+        ;; Calculate absolute differences
+        (lat-diff (if (> lat1 lat2) (to-uint (- lat1 lat2)) (to-uint (- lat2 lat1))))
+        (lng-diff (if (> lng1 lng2) (to-uint (- lng1 lng2)) (to-uint (- lng2 lng1))))
+        ;; Convert micro-degrees to distance units (simplified)
+        ;; Using Manhattan distance: |lat1-lat2| + |lng1-lng2|
+        (manhattan-distance (+ lat-diff lng-diff))
+        ;; Scale down and convert to reasonable distance units
+        (scaled-distance (/ manhattan-distance u10000))
+    )
+        ;; Return at least 1 unit of distance
+        (if (> scaled-distance u0) scaled-distance u1)
+    )
+)
+
+;; Calculate fare based on distance
+(define-private (calculate-fare-amount (distance uint))
+    (+ base-fare (* distance fare-per-unit))
 )
 
 ;; Public Functions
@@ -122,22 +163,40 @@
     )
 )
 
-;; Request a ride
-(define-public (request-ride (pickup-location (string-ascii 100)) (destination (string-ascii 100)) (fare uint))
+;; Calculate fare for given coordinates
+(define-read-only (calculate-fare (pickup-lat int) (pickup-lng int) (destination-lat int) (destination-lng int))
+    (begin
+        (asserts! (is-valid-coordinates pickup-lat pickup-lng) err-invalid-coordinates)
+        (asserts! (is-valid-coordinates destination-lat destination-lng) err-invalid-coordinates)
+        (let ((distance (calculate-simple-distance pickup-lat pickup-lng destination-lat destination-lng)))
+            (ok {
+                distance: distance,
+                fare: (calculate-fare-amount distance)
+            })
+        )
+    )
+)
+
+;; Request a ride with GPS coordinates
+(define-public (request-ride (pickup-lat int) (pickup-lng int) (destination-lat int) (destination-lng int))
     (let (
         (ride-id (+ (var-get ride-counter) u1))
         (rider tx-sender)
+        (distance (calculate-simple-distance pickup-lat pickup-lng destination-lat destination-lng))
+        (fare (calculate-fare-amount distance))
     )
         (asserts! (is-some (map-get? riders rider)) err-not-found)
-        (asserts! (is-valid-location pickup-location) err-invalid-input)
-        (asserts! (is-valid-location destination) err-invalid-input)
-        (asserts! (is-valid-fare fare) err-invalid-input)
+        (asserts! (is-valid-coordinates pickup-lat pickup-lng) err-invalid-coordinates)
+        (asserts! (is-valid-coordinates destination-lat destination-lng) err-invalid-coordinates)
         (var-set ride-counter ride-id)
         (map-set rides ride-id {
             rider: rider,
             driver: none,
-            pickup-location: pickup-location,
-            destination: destination,
+            pickup-lat: pickup-lat,
+            pickup-lng: pickup-lng,
+            destination-lat: destination-lat,
+            destination-lng: destination-lng,
+            distance: distance,
             fare: fare,
             status: "requested",
             created-at: stacks-block-height,
@@ -298,6 +357,15 @@
 ;; Get platform fee
 (define-read-only (get-platform-fee)
     (var-get platform-fee)
+)
+
+;; Get distance between two points (simplified calculation)
+(define-read-only (get-distance (lat1 int) (lng1 int) (lat2 int) (lng2 int))
+    (begin
+        (asserts! (is-valid-coordinates lat1 lng1) err-invalid-coordinates)
+        (asserts! (is-valid-coordinates lat2 lng2) err-invalid-coordinates)
+        (ok (calculate-simple-distance lat1 lng1 lat2 lng2))
+    )
 )
 
 ;; Admin functions (contract owner only)
