@@ -1,8 +1,7 @@
 ;; RideFlow - Decentralized Ride-Sharing Platform
 ;; A smart contract for managing ride requests, driver matching, and payments
 ;; Updated with GPS coordinate validation, simplified distance-based fare calculation,
-;; and multi-institution support for cross-platform operations
-;; FIXED: Addressed "use of potentially unchecked data" warnings
+;; multi-institution support, and dynamic surge pricing based on demand/supply metrics
 
 ;; Constants
 (define-constant contract-owner tx-sender)
@@ -18,6 +17,7 @@
 (define-constant err-institution-not-active (err u109))
 (define-constant err-institution-exists (err u110))
 (define-constant err-invalid-institution-fee (err u111))
+(define-constant err-invalid-surge-params (err u112))
 
 ;; Input validation constants
 (define-constant max-string-length u50)
@@ -37,10 +37,21 @@
 ;; Distance and fare calculation constants
 (define-constant fare-per-unit u100) ;; 100 micro-STX per distance unit
 
+;; Surge pricing constants
+(define-constant min-surge-multiplier u100) ;; 1.0x (in basis points: 100 = 1.0x)
+(define-constant max-surge-multiplier u500) ;; 5.0x maximum surge
+(define-constant surge-base u100) ;; Base multiplier (1.0x)
+(define-constant default-surge-threshold u3) ;; Demand/supply ratio threshold
+
 ;; Data Variables
 (define-data-var ride-counter uint u0)
 (define-data-var platform-fee uint u50) ;; 5% platform fee (in basis points)
 (define-data-var institution-counter uint u0)
+
+;; Surge pricing parameters
+(define-data-var surge-enabled bool true)
+(define-data-var surge-demand-threshold uint u3) ;; Rides per available driver threshold
+(define-data-var surge-step-multiplier uint u25) ;; Additional 0.25x per threshold unit
 
 ;; Data Maps
 (define-map institutions uint {
@@ -54,6 +65,13 @@
 })
 
 (define-map institution-by-owner principal uint)
+
+;; Track active rides and available drivers per institution for surge pricing
+(define-map institution-metrics uint {
+    active-rides: uint,
+    available-drivers: uint,
+    last-updated: uint
+})
 
 (define-map riders principal {
     name: (string-ascii 50),
@@ -82,7 +100,9 @@
     destination-lat: int,
     destination-lng: int,
     distance: uint,
-    fare: uint,
+    base-fare: uint,
+    surge-multiplier: uint,
+    final-fare: uint,
     status: (string-ascii 20), ;; "requested", "accepted", "in-progress", "completed", "cancelled"
     created-at: uint,
     completed-at: (optional uint),
@@ -138,7 +158,20 @@
     (and (is-valid-latitude lat) (is-valid-longitude lng))
 )
 
-;; Institution validation - FIXED: Added explicit error handling
+;; Surge pricing validation
+(define-private (is-valid-surge-multiplier (multiplier uint))
+    (and (>= multiplier min-surge-multiplier) (<= multiplier max-surge-multiplier))
+)
+
+(define-private (is-valid-surge-threshold (threshold uint))
+    (and (> threshold u0) (<= threshold u20))
+)
+
+(define-private (is-valid-surge-step (step uint))
+    (and (> step u0) (<= step u100))
+)
+
+;; Institution validation
 (define-private (is-institution-active (institution-id uint))
     (match (map-get? institutions institution-id)
         institution-data (get is-active institution-data)
@@ -146,7 +179,6 @@
     )
 )
 
-;; FIXED: Added safe institution validation with explicit checks
 (define-private (validate-institution-exists-and-active (institution-id uint))
     (let ((institution-data (map-get? institutions institution-id)))
         (and 
@@ -156,7 +188,6 @@
     )
 )
 
-;; FIXED: New helper function to validate optional institution parameter
 (define-private (validate-optional-institution (institution (optional uint)))
     (match institution
         institution-id 
@@ -169,26 +200,100 @@
 )
 
 ;; Simplified distance calculation using Manhattan distance
-;; This avoids complex square root calculations and function interdependencies
 (define-private (calculate-simple-distance (lat1 int) (lng1 int) (lat2 int) (lng2 int))
     (let (
-        ;; Calculate absolute differences
         (lat-diff (if (> lat1 lat2) (to-uint (- lat1 lat2)) (to-uint (- lat2 lat1))))
         (lng-diff (if (> lng1 lng2) (to-uint (- lng1 lng2)) (to-uint (- lng2 lng1))))
-        ;; Convert micro-degrees to distance units (simplified)
-        ;; Using Manhattan distance: |lat1-lat2| + |lng1-lng2|
         (manhattan-distance (+ lat-diff lng-diff))
-        ;; Scale down and convert to reasonable distance units
         (scaled-distance (/ manhattan-distance u10000))
     )
-        ;; Return at least 1 unit of distance
         (if (> scaled-distance u0) scaled-distance u1)
     )
 )
 
-;; Calculate fare based on distance
-(define-private (calculate-fare-amount (distance uint))
+;; Calculate surge multiplier based on demand and supply
+(define-private (calculate-surge-multiplier (institution-id uint))
+    (let (
+        (metrics (default-to 
+            {active-rides: u0, available-drivers: u0, last-updated: u0}
+            (map-get? institution-metrics institution-id)))
+        (active-rides (get active-rides metrics))
+        (available-drivers (get available-drivers metrics))
+        (threshold (var-get surge-demand-threshold))
+        (step-multiplier (var-get surge-step-multiplier))
+    )
+        (if (and (var-get surge-enabled) (> available-drivers u0))
+            (let (
+                ;; Calculate demand ratio (rides per driver)
+                (demand-ratio (/ active-rides available-drivers))
+                ;; Calculate how many threshold units we've exceeded
+                (threshold-units (if (> demand-ratio threshold)
+                    (- demand-ratio threshold)
+                    u0))
+                ;; Calculate surge: base + (threshold-units * step-multiplier)
+                (calculated-surge (+ surge-base (* threshold-units step-multiplier)))
+                ;; Cap at maximum surge multiplier
+                (capped-surge (if (> calculated-surge max-surge-multiplier)
+                    max-surge-multiplier
+                    calculated-surge))
+            )
+                ;; Ensure minimum surge of 1.0x
+                (if (< capped-surge min-surge-multiplier)
+                    min-surge-multiplier
+                    capped-surge)
+            )
+            surge-base ;; Default to 1.0x if surge disabled or no drivers
+        )
+    )
+)
+
+;; Calculate base fare based on distance
+(define-private (calculate-base-fare (distance uint))
     (+ base-fare (* distance fare-per-unit))
+)
+
+;; Calculate final fare with surge pricing
+(define-private (calculate-fare-with-surge (distance uint) (institution-id uint))
+    (let (
+        (calculated-base-fare (calculate-base-fare distance))
+        (surge-multiplier (calculate-surge-multiplier institution-id))
+        ;; Apply surge: (base-fare * surge-multiplier) / 100
+        (final-fare (/ (* calculated-base-fare surge-multiplier) u100))
+    )
+        {
+            base-fare: calculated-base-fare,
+            surge-multiplier: surge-multiplier,
+            final-fare: final-fare
+        }
+    )
+)
+
+;; Update institution metrics for surge pricing
+(define-private (update-institution-metrics (institution-id uint) (active-rides-delta int) (available-drivers-delta int))
+    (let (
+        (current-metrics (default-to
+            {active-rides: u0, available-drivers: u0, last-updated: u0}
+            (map-get? institution-metrics institution-id)))
+        (current-active (get active-rides current-metrics))
+        (current-available (get available-drivers current-metrics))
+        (new-active (if (>= active-rides-delta 0)
+            (+ current-active (to-uint active-rides-delta))
+            (if (>= current-active (to-uint (- 0 active-rides-delta)))
+                (- current-active (to-uint (- 0 active-rides-delta)))
+                u0)))
+        (new-available (if (>= available-drivers-delta 0)
+            (+ current-available (to-uint available-drivers-delta))
+            (if (>= current-available (to-uint (- 0 available-drivers-delta)))
+                (- current-available (to-uint (- 0 available-drivers-delta)))
+                u0)))
+    )
+        (map-set institution-metrics institution-id {
+            active-rides: new-active,
+            available-drivers: new-available,
+            last-updated: stacks-block-height
+        })
+        true
+    )
 )
 
 ;; Public Functions
@@ -214,6 +319,14 @@
             created-at: stacks-block-height
         })
         (map-set institution-by-owner owner institution-id)
+        
+        ;; Initialize metrics for surge pricing
+        (map-set institution-metrics institution-id {
+            active-rides: u0,
+            available-drivers: u0,
+            last-updated: stacks-block-height
+        })
+        
         (ok institution-id)
     )
 )
@@ -248,11 +361,9 @@
 )
 
 ;; Register as a rider with optional preferred institution
-;; FIXED: Used new validation helper function
 (define-public (register-rider (name (string-ascii 50)) (preferred-institution (optional uint)))
     (let ((rider tx-sender))
         (asserts! (is-valid-string name) err-invalid-input)
-        ;; FIXED: Use the new validation helper to check the optional institution
         (asserts! (validate-optional-institution preferred-institution) err-institution-not-active)
         
         (map-set riders rider {
@@ -267,7 +378,6 @@
 )
 
 ;; Register as a driver with institution
-;; FIXED: Added explicit validation for institution-id
 (define-public (register-driver (name (string-ascii 50)) (vehicle-type (string-ascii 20)) (license-plate (string-ascii 10)) (institution-id uint))
     (let (
         (driver tx-sender)
@@ -290,76 +400,87 @@
             institution-id: institution-id
         })
         
-        ;; Update institution driver count
+        ;; Update institution driver count and metrics
         (map-set institutions institution-id (merge institution-data {
             total-drivers: (+ (get total-drivers institution-data) u1)
         }))
+        
+        (update-institution-metrics institution-id 0 1)
         
         (ok true)
     )
 )
 
-;; Calculate fare for given coordinates
-(define-read-only (calculate-fare (pickup-lat int) (pickup-lng int) (destination-lat int) (destination-lng int))
+;; Calculate fare for given coordinates with surge pricing
+(define-read-only (calculate-fare (pickup-lat int) (pickup-lng int) (destination-lat int) (destination-lng int) (institution-id uint))
     (begin
         (asserts! (is-valid-coordinates pickup-lat pickup-lng) err-invalid-coordinates)
         (asserts! (is-valid-coordinates destination-lat destination-lng) err-invalid-coordinates)
-        (let ((distance (calculate-simple-distance pickup-lat pickup-lng destination-lat destination-lng)))
+        (asserts! (> institution-id u0) err-invalid-input)
+        (let (
+            (distance (calculate-simple-distance pickup-lat pickup-lng destination-lat destination-lng))
+            (fare-info (calculate-fare-with-surge distance institution-id))
+        )
             (ok {
                 distance: distance,
-                fare: (calculate-fare-amount distance)
+                base-fare: (get base-fare fare-info),
+                surge-multiplier: (get surge-multiplier fare-info),
+                final-fare: (get final-fare fare-info)
             })
         )
     )
 )
 
 ;; Request a ride with GPS coordinates and optional institution preference
-;; FIXED: Added comprehensive validation for institution handling using helper function
 (define-public (request-ride (pickup-lat int) (pickup-lng int) (destination-lat int) (destination-lng int) (preferred-institution (optional uint)))
     (let (
         (ride-id (+ (var-get ride-counter) u1))
         (rider tx-sender)
         (rider-data (unwrap! (map-get? riders rider) err-not-found))
         (distance (calculate-simple-distance pickup-lat pickup-lng destination-lat destination-lng))
-        (fare (calculate-fare-amount distance))
     )
         (asserts! (is-valid-coordinates pickup-lat pickup-lng) err-invalid-coordinates)
         (asserts! (is-valid-coordinates destination-lat destination-lng) err-invalid-coordinates)
-        ;; FIXED: Validate the preferred-institution parameter using helper function
         (asserts! (validate-optional-institution preferred-institution) err-institution-not-active)
         
-        ;; FIXED: Determine final institution with proper validation
         (let ((final-institution 
             (match preferred-institution
-                pref-id pref-id ;; Already validated above
+                pref-id pref-id
                 (match (get preferred-institution rider-data)
                     rider-pref (begin
                         (asserts! (validate-institution-exists-and-active rider-pref) err-institution-not-active)
                         rider-pref
                     )
-                    u1 ;; Default to institution 1 - should validate this exists
+                    u1
                 )
             )))
             
-            ;; Validate the final institution choice
             (asserts! (validate-institution-exists-and-active final-institution) err-institution-not-active)
             
-            (var-set ride-counter ride-id)
-            (map-set rides ride-id {
-                rider: rider,
-                driver: none,
-                pickup-lat: pickup-lat,
-                pickup-lng: pickup-lng,
-                destination-lat: destination-lat,
-                destination-lng: destination-lng,
-                distance: distance,
-                fare: fare,
-                status: "requested",
-                created-at: stacks-block-height,
-                completed-at: none,
-                institution-id: final-institution
-            })
-            (ok ride-id)
+            (let ((fare-info (calculate-fare-with-surge distance final-institution)))
+                (var-set ride-counter ride-id)
+                (map-set rides ride-id {
+                    rider: rider,
+                    driver: none,
+                    pickup-lat: pickup-lat,
+                    pickup-lng: pickup-lng,
+                    destination-lat: destination-lat,
+                    destination-lng: destination-lng,
+                    distance: distance,
+                    base-fare: (get base-fare fare-info),
+                    surge-multiplier: (get surge-multiplier fare-info),
+                    final-fare: (get final-fare fare-info),
+                    status: "requested",
+                    created-at: stacks-block-height,
+                    completed-at: none,
+                    institution-id: final-institution
+                })
+                
+                ;; Update metrics: increment active rides
+                (update-institution-metrics final-institution 1 0)
+                
+                (ok ride-id)
+            )
         )
     )
 )
@@ -385,6 +506,10 @@
         (map-set drivers driver (merge driver-info {
             is-available: false
         }))
+        
+        ;; Update metrics: decrement available drivers
+        (update-institution-metrics ride-institution-id 0 -1)
+        
         (ok true)
     )
 )
@@ -413,7 +538,7 @@
         (rider-info (unwrap! (map-get? riders (get rider ride)) err-not-found))
         (ride-institution-id (get institution-id ride))
         (institution-data (unwrap! (map-get? institutions ride-institution-id) err-not-found))
-        (fare (get fare ride))
+        (fare (get final-fare ride))
         (calculated-platform-fee (/ (* fare (var-get platform-fee)) u1000))
         (calculated-institution-fee (/ (* fare (get fee-percentage institution-data)) u1000))
         (driver-payment (- fare (+ calculated-platform-fee calculated-institution-fee)))
@@ -456,6 +581,9 @@
             total-rides: (+ (get total-rides institution-data) u1)
         }))
         
+        ;; Update metrics: decrement active rides, increment available drivers
+        (update-institution-metrics ride-institution-id -1 1)
+        
         (ok true)
     )
 )
@@ -465,6 +593,7 @@
     (let (
         (ride (unwrap! (map-get? rides ride-id) err-not-found))
         (caller tx-sender)
+        (ride-institution-id (get institution-id ride))
     )
         (asserts! (or (is-eq caller (get rider ride)) 
                      (is-eq (some caller) (get driver ride))) err-unauthorized)
@@ -475,12 +604,16 @@
             status: "cancelled"
         }))
         
-        ;; If driver was assigned, make them available again
+        ;; Update metrics: decrement active rides
+        (update-institution-metrics ride-institution-id -1 0)
+        
+        ;; If driver was assigned, make them available again and update metrics
         (match (get driver ride)
             driver-principal (let ((driver-info (unwrap! (map-get? drivers driver-principal) err-not-found)))
                 (map-set drivers driver-principal (merge driver-info {
                     is-available: true
                 }))
+                (update-institution-metrics ride-institution-id 0 1)
                 (ok true)
             )
             (ok true)
@@ -493,27 +626,51 @@
     (let (
         (driver tx-sender)
         (driver-info (unwrap! (map-get? drivers driver) err-not-found))
+        (institution-id (get institution-id driver-info))
+        (was-available (get is-available driver-info))
     )
         (map-set drivers driver (merge driver-info {
             is-available: available
         }))
+        
+        ;; Update metrics based on availability change
+        (if (and (not was-available) available)
+            (update-institution-metrics institution-id 0 1)
+            (if (and was-available (not available))
+                (update-institution-metrics institution-id 0 -1)
+                true
+            )
+        )
+        
         (ok true)
     )
 )
 
 ;; Update rider preferred institution
-;; FIXED: Used validation helper function for institution parameter
 (define-public (set-preferred-institution (institution-id (optional uint)))
     (let (
         (rider tx-sender)
         (rider-info (unwrap! (map-get? riders rider) err-not-found))
     )
-        ;; FIXED: Use the validation helper function
         (asserts! (validate-optional-institution institution-id) err-institution-not-active)
         
         (map-set riders rider (merge rider-info {
             preferred-institution: institution-id
         }))
+        (ok true)
+    )
+)
+
+;; Admin function to update surge pricing parameters
+(define-public (update-surge-parameters (enabled bool) (demand-threshold uint) (step-multiplier uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (is-valid-surge-threshold demand-threshold) err-invalid-surge-params)
+        (asserts! (is-valid-surge-step step-multiplier) err-invalid-surge-params)
+        
+        (var-set surge-enabled enabled)
+        (var-set surge-demand-threshold demand-threshold)
+        (var-set surge-step-multiplier step-multiplier)
         (ok true)
     )
 )
@@ -530,6 +687,31 @@
     (match (map-get? institution-by-owner owner)
         institution-id (map-get? institutions institution-id)
         none
+    )
+)
+
+;; Get institution metrics for surge pricing
+(define-read-only (get-institution-metrics (institution-id uint))
+    (map-get? institution-metrics institution-id)
+)
+
+;; Get current surge info for an institution
+(define-read-only (get-surge-info (institution-id uint))
+    (let (
+        (metrics (default-to
+            {active-rides: u0, available-drivers: u0, last-updated: u0}
+            (map-get? institution-metrics institution-id)))
+        (surge-mult (calculate-surge-multiplier institution-id))
+    )
+        (ok {
+            institution-id: institution-id,
+            active-rides: (get active-rides metrics),
+            available-drivers: (get available-drivers metrics),
+            surge-multiplier: surge-mult,
+            surge-enabled: (var-get surge-enabled),
+            demand-threshold: (var-get surge-demand-threshold),
+            last-updated: (get last-updated metrics)
+        })
     )
 )
 
@@ -568,6 +750,17 @@
     (var-get platform-fee)
 )
 
+;; Get surge pricing parameters
+(define-read-only (get-surge-parameters)
+    (ok {
+        enabled: (var-get surge-enabled),
+        demand-threshold: (var-get surge-demand-threshold),
+        step-multiplier: (var-get surge-step-multiplier),
+        min-multiplier: min-surge-multiplier,
+        max-multiplier: max-surge-multiplier
+    })
+)
+
 ;; Get distance between two points (simplified calculation)
 (define-read-only (get-distance (lat1 int) (lng1 int) (lat2 int) (lng2 int))
     (begin
@@ -578,7 +771,6 @@
 )
 
 ;; Get available drivers by institution
-;; FIXED: Added proper validation for institution-id parameter
 (define-read-only (get-drivers-by-institution (institution-id uint))
     (begin
         (asserts! (> institution-id u0) err-invalid-input)
